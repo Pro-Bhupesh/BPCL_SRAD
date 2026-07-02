@@ -1966,7 +1966,7 @@ let _annTimers = {};
 //  HELPERS
 // ═══════════════════════════════════════════════════════
 const $  = id => document.getElementById(id);
-const H  = (id,html) => $(id).innerHTML = html;
+const H  = (id,html) => { const el=$(id); if(el) el.innerHTML = html; };
 const E  = s => String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 const pct = v => Math.round(v*100) + '%';
 // upc() removed — was identical to pct()
@@ -3184,7 +3184,7 @@ function jumpToTA(terr){
 // ═══════════════════════════════════════════════════════
 function renderTA(){
   const terr=$('taTerrPicker').value;
-  H('ta-kpis',''); H('ta-partial-tbody',''); H('ta-offline-tbody',''); H('ta-noob-tbody','');
+  H('ta-kpis',''); H('ta-partial-tbody',''); H('ta-offline-tbody','');
   if(!terr||!ROWS.length) return;
 
   const mine=ROWS.filter(r=>r.terr===terr);
@@ -3192,7 +3192,6 @@ function renderTA(){
   TA_ROWS.offline =mine.filter(r=>r.status==='Offline');
   const noobForTerr=NOT_ONBOARDED.filter(r=>r.terr===terr);
   const ann=getAnn();
-  const noobAnn=getNoobAnn();
 
   const iss=TA_ROWS.partial.length+TA_ROWS.offline.length;
   const annotated=mine.filter(r=>r.status!=='Fully Online'&&(ann[r.roId]?.dep||ann[r.roId]?.iss)).length;
@@ -3223,11 +3222,9 @@ function renderTA(){
 
   $('cnt-partial').textContent=`(${TA_ROWS.partial.length})`;
   $('cnt-offline').textContent=`(${TA_ROWS.offline.length})`;
-  $('cnt-noob').textContent=`(${noobForTerr.length})`;
 
   renderTATable('ta-partial-tbody', TA_ROWS.partial, ann);
   renderTATable('ta-offline-tbody',  TA_ROWS.offline,  ann);
-  renderTANoobTable('ta-noob-tbody', noobForTerr, noobAnn);
 }
 
 function renderTANoobTable(id, rows, noobAnn){
