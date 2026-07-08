@@ -9,6 +9,10 @@
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<!-- Firebase (compat SDK — classic scripts, exposes global `firebase`) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <style>
 /* ═══════════════════════════════ TOKENS ═══════════════════════════════ */
 :root{
@@ -677,13 +681,13 @@ button:focus-visible,a:focus-visible{outline-color:var(--yellow)}
         <input type="file" id="fileInput" accept=".xlsx,.xls" onchange="loadFile(this)">
         <div class="uz-ico">📊</div>
         <div class="uz-t">Click to select HOS Export (.xlsx)</div>
-        <div class="uz-s">Daily export from BPCL HOS system</div>
+        <div class="uz-s">Daily HOS 222 export from BPCL HOS system</div>
       </div>
       <div id="uploadMsg"></div>
       <div class="info-box" style="margin-top:16px">
-        <strong>Required columns:</strong> RO ID · Retail Outlet · RA Vendor · Sales Area · Territory · State ·
-        IOT Enabled · No. of On-Boarded MPDs · No. of Online MPDs · No. of On-Boarded Tanks · No. of Online Tanks ·
-        MPD configuration mismatch · Tank configuration mismatch
+        <strong>Required columns (HOS 222):</strong> RO ID · Retail Outlet · RA Vendor · IOT Enabled ·
+        MPDs · Online MPDs · Tanks · Online Tanks.<br>
+        <span style="color:var(--text-dim)">Territory &amp; State are taken from the BL Master customer list (by RO ID) — not from the HOS file.</span>
       </div>
 
       <!-- BL Master — collapsible, only needed once or when ROs change -->
@@ -1460,234 +1464,467 @@ const NOOB_ANN_KEY = 'bpcl_noob_ann_v1';
 const ANN_KEY = 'bpcl_sr_ann_v1';
 const CHARTS = {};
 
-// ── GAS backend ──────────────────────────────────────────
-const GAS_URL       = 'https://script.google.com/macros/s/AKfycbz9vvwr4T8nG2Q-l2oRAHNM8gRml2U2fYeqCGhZ5d_v-hUH03W2orxAer4SyeL-QgM8/exec';
-const GAS_WRITE_KEY = 'bpcl-sr-2026'; // must match WRITE_KEY in SR_Dashboard_GAS.gs
+// ── FIREBASE BACKEND ADAPTER ─────────────────────────────────────────────
+// This block replaces the old Google Apps Script / Sheets backend.
+// The rest of the dashboard is UNCHANGED: it still calls gasGet(action, params, cb)
+// and gets back the same { ok:true, data:{...} } shape it always did — only now
+// every action is served by Firebase Authentication + Cloud Firestore.
+//
+//  ┌─────────────────────────────────────────────────────────────────────┐
+//  │  1.  Paste your Firebase web-app config below (Console → Project      │
+//  │      settings → Your apps → SDK setup and configuration → Config).    │
+//  │  2.  AUTH_EMAIL_DOMAIN lets officers log in with a short username      │
+//  │      instead of an email. Usernames map to <username>@<domain>        │
+//  │      internally. Keep this value fixed once users are created.        │
+//  └─────────────────────────────────────────────────────────────────────┘
+const FIREBASE_CONFIG = {
+  apiKey:            'PASTE_API_KEY',
+  authDomain:        'PASTE_PROJECT_ID.firebaseapp.com',
+  projectId:         'PASTE_PROJECT_ID',
+  storageBucket:     'PASTE_PROJECT_ID.appspot.com',
+  messagingSenderId: 'PASTE_SENDER_ID',
+  appId:             'PASTE_APP_ID',
+};
+const AUTH_EMAIL_DOMAIN = 'sr-dashboard.local';   // internal only — never emailed
+
+// ── init ─────────────────────────────────────────────────────────────────
+firebase.initializeApp(FIREBASE_CONFIG);
+const _auth = firebase.auth();
+const _db   = firebase.firestore();
 
 let _cbIdx = 0;
-let _sessionToken = null;   // set after successful login, cleared on logout
+let _sessionToken = null;   // holds the Firebase uid after login
 let USER_INFO     = null;   // { username, role, territory, state, name }
 
-/** JSONP GET — works around GAS CORS for read requests.
- *  Includes 30-second timeout so the UI never hangs forever if GAS doesn't respond. */
-function gasGet(action, params, cb){
-  const idx = ++_cbIdx;
-  const cbName = '_gasCb' + idx;
-  // Automatically include session token on every request (GAS ignores it if not needed)
-  const allParams = Object.assign({}, params || {});
-  if(_sessionToken && !allParams.token) allParams.token = _sessionToken;
-  const qs = Object.entries(Object.assign({action, callback: cbName}, allParams))
-    .map(([k,v])=>encodeURIComponent(k)+'='+encodeURIComponent(v)).join('&');
-
-  let done = false;
-  const timer = setTimeout(() => {
-    if(done) return;
-    done = true;
-    delete window[cbName];
-    document.getElementById('_gasSc'+idx)?.remove();
-    cb({ok:false, error:'GAS timed out (30s) — check your deployment'});
-  }, 30000);
-
-  window[cbName] = function(res){
-    if(done) return;
-    done = true;
-    clearTimeout(timer);
-    delete window[cbName];
-    document.getElementById('_gasSc'+idx)?.remove();
-    try{ cb(res); }catch(e){ console.error('gasGet cb error',e); }
-  };
-  const s = document.createElement('script');
-  s.id = '_gasSc' + idx;
-  s.src = GAS_URL + '?' + qs;
-  s.onerror = () => {
-    if(done) return;
-    done = true;
-    clearTimeout(timer);
-    delete window[cbName];
-    s.remove();
-    cb({ok:false, error:'Network error — check internet or GAS URL'});
-  };
-  document.head.appendChild(s);
-}
-
-/** Fire-and-forget POST — no-cors, response is opaque */
-// ── WRITE HELPERS (all via JSONP GET — avoids POST redirect body-drop) ──────
-
-/** Small write (annotations etc.) — fire-and-forget JSONP GET */
-function gasGetWrite(action, data){
-  gasGet(action, {key: GAS_WRITE_KEY, data: JSON.stringify(data)}, ()=>{});
-}
-
-// Compact 13-field format (GAS derives the other 8 fields server-side).
-// Chunk size for uploads is now computed dynamically by encoded URL length —
-// see MAX_CHUNK_PAYLOAD_CHARS inside gasUploadChunked() below — because a
-// fixed row count that's safe for short outlet/vendor names produced URLs
-// long enough to be rejected ("Network error") for longer ones.
+const _email = u => String(u || '').trim().toLowerCase() + '@' + AUTH_EMAIL_DOMAIN;
+const _pct   = (n, d) => d ? Math.round((n / d) * 10000) / 100 : 0;   // 0–100, 2dp
 
 /**
- * Returns true if a GAS write-action response indicates success.
- * Write actions return {ok:true, data:{...}} via the JSONP wrapper, so
- * we must check BOTH the outer ok AND that data doesn't signal an error.
+ * Drop-in replacement for the old JSONP gasGet(). Dispatches the action to a
+ * Firestore-backed handler and calls cb with the SAME response envelope the
+ * rest of the app expects:  read handlers → { ok:true, data:<result> },
+ * a thrown error → { ok:false, error:msg }. Business-level failures are
+ * returned INSIDE data as { ok:false, error } (matching the old GAS contract),
+ * so gasWriteOk()/login checks keep working untouched.
  */
+function gasGet(action, params, cb){
+  cb = cb || function(){};
+  _dispatch(action, params || {}).then(
+    data => cb({ ok: true,  data: data }),
+    err  => cb({ ok: false, error: (err && err.message) ? err.message : String(err) })
+  );
+}
+
+/** Small write (annotations etc.) — fire-and-forget, same signature as before. */
+function gasGetWrite(action, data){
+  gasGet(action, { data: JSON.stringify(data) }, function(){});
+}
+
+/** True if a write-action response indicates success (unchanged logic). */
 function gasWriteOk(res){
-  if(!res || !res.ok) return false;                    // outer JSONP / network error
-  if(res.error) return false;                          // outer error field
-  if(res.data && res.data.ok === false) return false;  // inner handler returned {ok:false}
-  if(res.data && res.data.error) return false;         // ← KEY FIX: catches "Unknown action: uploadChunk"
-  return true;                                         //   when old GAS hasn't been redeployed yet
+  if(!res || !res.ok) return false;
+  if(res.error) return false;
+  if(res.data && res.data.ok === false) return false;
+  if(res.data && res.data.error) return false;
+  return true;
 }
 function gasWriteErr(res){
   if(!res) return 'No response';
   return (res.data && res.data.error) || res.error || 'Unknown error';
 }
 
-/**
- * Chunked HOS upload via JSONP GET — compact format, strictly sequential.
- *
- * Each chunk is sent only after the previous one confirms success.
- * Uses GAS getLastRow()+1 append (safe, no startRow races).
- * After all chunks, calls uploadFinalize to build summary tabs.
- *
- * Chunks are sized by *encoded URL length*, not a fixed row count — outlet
- * and vendor names vary a lot in length across territories, so a fixed row
- * count that's safe for short names can build a URL long enough to be
- * silently rejected ("Network error") by GAS or a proxy in between for
- * longer ones. If a chunk still fails with a transport-level error (no
- * response reached us at all — as opposed to GAS responding with a real
- * error), it's automatically split in half and retried, rather than being
- * retried identically — this self-adapts to whatever the real limit is.
- *
- * onProgress(done, total) — called after each chunk completes
- * onDone(ok, errMsg)      — called at the very end
- */
-function gasUploadChunked(date, rows, onProgress, onDone){
-  // Compact 13-field format: GAS computes mOff/tOff/status/uptimes server-side
-  const rowArrays = rows.map(r => [
-    r.roId, r.name, r.vendor, r.area, r.terr, r.state, r.iot,
-    r.mOn, r.mOl, r.tOn, r.tOl,
-    r.mMis || '', r.tMis || ''
-  ]);
-
-  // Target: keep the full request URL comfortably under ~2KB (safe under
-  // common browser/corporate-proxy GET URL limits), while still batching
-  // rows together for reasonable upload speed.
-  const MAX_CHUNK_PAYLOAD_CHARS = 1800;
-  function chunkBySize(list){
-    const out = [];
-    let cur = [], curLen = 2; // 2 = '[' + ']'
-    for(const arr of list){
-      const encLen = encodeURIComponent(JSON.stringify(arr)).length + 3; // +3 ≈ comma/quote overhead
-      if(cur.length && curLen + encLen > MAX_CHUNK_PAYLOAD_CHARS){ out.push(cur); cur = []; curLen = 2; }
-      cur.push(arr);
-      curLen += encLen;
-    }
-    if(cur.length) out.push(cur);
-    return out;
+// ── ACTION ROUTER ─────────────────────────────────────────────────────────
+async function _dispatch(action, p){
+  switch(action){
+    case 'ping':              return { ok:true, ts:new Date().toISOString() };
+    case 'init':              return await _getInit();
+    case 'getData':           return await _getData(p.date);
+    case 'getLatestDate':     return { date: await _getLatestDate() };
+    case 'getAvailableDates': return { dates: await _getDates() };
+    case 'getAnnotations':    return { ann: await _getAnnotations(), noobAnn: await _getNoob() };
+    case 'getTrend':          return await _getTrend(p.type || 'region', p.scope || '', (+p.days) || 7);
+    case 'debug':             return await _getDebug();
+    case 'rebuildSummaries':  return await _rebuildSummaries();
+    case 'saveAnnotationGET':     return await _saveAnnotation(JSON.parse(p.data || '{}'));
+    case 'saveNoobAnnotationGET': return await _saveNoob(JSON.parse(p.data || '{}'));
+    case 'login':             return await _login(p.username, p.password);
+    case 'listUsers':         return await _listUsers();
+    case 'createUser':        return await _createUser(p);
+    case 'updateUser':        return await _updateUser(p);
+    case 'deleteUser':        return await _deleteUser(p);
+    case 'changePassword':    return await _changePassword(p);
+    default:                  return { error: 'Unknown action: ' + (action || '(none)') };
   }
-
-  const queue = chunkBySize(rowArrays);  // mutable — failed oversized chunks get split and requeued
-  let completed = 0;
-  let everSucceeded = false; // only the first *successful* write should carry first=true
-
-  function sendNext(retryLeft){
-    if(!queue.length){
-      // All chunks written — compute summaries
-      gasGet('uploadFinalize', {key: GAS_WRITE_KEY, date}, res => {
-        if(!gasWriteOk(res)) onDone(false, 'Summary compute failed: ' + gasWriteErr(res));
-        else onDone(true);
-      });
-      return;
-    }
-
-    const chunk = queue[0];
-    gasGet('uploadChunk', {
-      key:   GAS_WRITE_KEY,
-      date,
-      rows:  JSON.stringify(chunk),
-      first: String(!everSucceeded)
-    }, res => {
-      if(!gasWriteOk(res)){
-        // Transport-level failure (script tag onerror / 30s timeout) means no
-        // real GAS response reached us at all — distinct from GAS responding
-        // with an actual error (res.data present), which retrying at a
-        // smaller size won't fix.
-        const transportFailure = !!(res && !res.data && res.error);
-        if(transportFailure && chunk.length > 1){
-          const mid = Math.ceil(chunk.length / 2);
-          queue.splice(0, 1, chunk.slice(0, mid), chunk.slice(mid));
-          sendNext(1);
-          return;
-        }
-        if(retryLeft > 0){
-          // 1 automatic retry after 2-second back-off
-          setTimeout(() => sendNext(retryLeft - 1), 2000);
-          return;
-        }
-        onDone(false, 'Chunk ' + (completed+1) + '/' + (completed+queue.length) + ' failed: ' + gasWriteErr(res));
-        return;
-      }
-      queue.shift();
-      completed++;
-      everSucceeded = true;
-      if(onProgress) onProgress(completed, completed + queue.length);
-      sendNext(1);  // each new chunk starts with 1 retry available
-    });
-  }
-
-  sendNext(1);  // start with 1 retry available
 }
 
-/** Chunked BL Master upload via JSONP GET (sequential).
- *  Sized by encoded URL length (same reasoning as gasUploadChunked above) — a
- *  fixed 300-row chunk of real outlet names comfortably exceeds 20KB encoded,
- *  which is well past the length HOS uploads were already failing at. Splits
- *  and retries a chunk that fails with a transport-level error. */
-function gasUploadBLChunked(rows, onDone){
-  const rowArrays = rows.map(r => [r.roId, r.name || '', r.terr || '']);
-
-  const MAX_CHUNK_PAYLOAD_CHARS = 1800;
-  function chunkBySize(list){
-    const out = [];
-    let cur = [], curLen = 2;
-    for(const arr of list){
-      const encLen = encodeURIComponent(JSON.stringify(arr)).length + 3;
-      if(cur.length && curLen + encLen > MAX_CHUNK_PAYLOAD_CHARS){ out.push(cur); cur = []; curLen = 2; }
-      cur.push(arr);
-      curLen += encLen;
-    }
-    if(cur.length) out.push(cur);
-    return out;
+// ── READS ───────────────────────────────────────────────────────────────
+async function _getDates(){
+  const d = await _db.collection('meta').doc('dates').get();
+  const arr = d.exists ? (d.data().dates || []) : [];
+  return arr.filter(x => /^\d{4}-\d{2}-\d{2}$/.test(x)).sort();
+}
+async function _getLatestDate(){
+  const dates = await _getDates();
+  return dates.length ? dates[dates.length - 1] : null;
+}
+async function _getData(date){
+  if(!date) date = await _getLatestDate();
+  if(!date) return { rows: [], date: null };
+  const snap = await _db.collection('snapshots').doc(date).get();
+  if(!snap.exists) return { rows: [], date, error: 'No data for ' + date };
+  const chunks = await _db.collection('snapshots').doc(date).collection('chunks').get();
+  const byId = chunks.docs.slice().sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric:true }));
+  let rows = [];
+  byId.forEach(c => { rows = rows.concat(c.data().rows || []); });
+  return { rows, date };
+}
+async function _getAnnotations(){
+  const snaps = await _db.collection('annotations').get();
+  const ann = {};
+  snaps.forEach(d => {
+    const a = d.data();
+    ann[String(a.roId || d.id)] = { dep: a.dep || '', iss: a.iss || '', rmk: a.rmk || '' };
+  });
+  return ann;
+}
+async function _getNoob(){
+  const snaps = await _db.collection('noobAnnotations').get();
+  const noob = {};
+  snaps.forEach(d => {
+    const a = d.data();
+    noob[String(a.roId || d.id)] = { reason: a.reason || '', rmk: a.rmk || '' };
+  });
+  return noob;
+}
+async function _getBL(){
+  const snaps = await _db.collection('blMaster').get();
+  const byId = snaps.docs.slice().sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric:true }));
+  const out = [];
+  byId.forEach(d => (d.data().rows || []).forEach(r =>
+    out.push({ roId: String(r[0] || ''), name: r[1] || '', terr: r[2] || '' })));
+  return out.filter(r => r.roId);
+}
+async function _getInit(){
+  const dates   = await _getDates();
+  const date    = dates.length ? dates[dates.length - 1] : null;
+  const roData  = date ? await _getData(date) : { rows: [], date: null };
+  const ann     = await _getAnnotations();
+  const noobAnn = await _getNoob();
+  const blRows  = await _getBL();
+  return { date, dates, rows: roData.rows, ann, noobAnn, blRows };
+}
+async function _getDebug(){
+  const dates = await _getDates();
+  const bl    = await _db.collection('meta').doc('bl').get();
+  const dateTabs = [];
+  for(const dt of dates){
+    const s = await _db.collection('snapshots').doc(dt).get();
+    dateTabs.push(dt + ':' + (s.exists ? (s.data().count || 0) : 0) + ' data rows');
   }
+  return {
+    allTabs:      dates.map(d => 'snapshot ' + d),
+    dateTabs:     dateTabs,
+    dailySummary: dates.length + ' entries',
+    blMaster:     bl.exists ? (bl.data().count || 0) + ' ROs' : 'MISSING',
+    latestDate:   dates.length ? dates[dates.length - 1] : null,
+  };
+}
 
-  const queue = chunkBySize(rowArrays);
-  let everSucceeded = false;
+// ── TREND ─────────────────────────────────────────────────────────────────
+function _emptyTrend(){
+  return { labels: [], series: { onlinePct:[], partialPct:[], offlinePct:[], mpdUptime:[], atgUptime:[] },
+           delta: { online:0, partial:0, offline:0, mpd:0, atg:0 } };
+}
+function _fmtLbl(d){
+  const m = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const p = d.split('-'); return (+p[2]) + ' ' + m[+p[1] - 1];
+}
+async function _getTrend(type, scope, days){
+  days = Math.max(1, Math.min(days || 7, 30));
+  const allDates = await _getDates();
+  const dates = allDates.slice(-days);
+  if(!dates.length) return _emptyTrend();
 
-  function sendNext(retryLeft){
-    if(!queue.length){ onDone(true); return; }
-    const chunk = queue[0];
-    gasGet('blChunk', {
-      key:   GAS_WRITE_KEY,
-      rows:  JSON.stringify(chunk),
-      first: String(!everSucceeded)
-    }, res => {
-      if(!gasWriteOk(res)){
-        const transportFailure = !!(res && !res.data && res.error);
-        if(transportFailure && chunk.length > 1){
-          const mid = Math.ceil(chunk.length / 2);
-          queue.splice(0, 1, chunk.slice(0, mid), chunk.slice(mid));
-          sendNext(1);
-          return;
-        }
-        if(retryLeft > 0){ setTimeout(() => sendNext(retryLeft - 1), 2000); return; }
-        onDone(false, gasWriteErr(res));
-        return;
+  const coll = type === 'state' ? 'stateSummary' : type === 'territory' ? 'terrSummary' : 'dailySummary';
+  const docs = await Promise.all(dates.map(d => _db.collection(coll).doc(d).get()));
+
+  const series = { onlinePct:[], partialPct:[], offlinePct:[], mpdUptime:[], atgUptime:[] };
+  docs.forEach(doc => {
+    let rec = null;
+    if(doc.exists){
+      if(type === 'region'){ rec = doc.data(); }
+      else {
+        const list = doc.data().rows || [];
+        const key  = type === 'state' ? 'state' : 'terr';
+        rec = list.find(r => String(r[key]) === scope) || null;
       }
-      queue.shift();
-      everSucceeded = true;
-      sendNext(1);
-    });
+    }
+    if(!rec){ Object.values(series).forEach(a => a.push(null)); return; }
+    series.onlinePct.push(rec.onlinePct  != null ? rec.onlinePct  : 0);
+    series.partialPct.push(rec.partialPct != null ? rec.partialPct : 0);
+    series.offlinePct.push(rec.offlinePct != null ? rec.offlinePct : 0);
+    series.mpdUptime.push(rec.mpdUptime   != null ? rec.mpdUptime  : 0);
+    series.atgUptime.push(rec.atgUptime   != null ? rec.atgUptime  : 0);
+  });
+
+  const last = series.onlinePct.length - 1;
+  const prev = last > 0 ? last - 1 : null;
+  const delta = a => (prev === null || a[last] === null || a[prev] === null)
+    ? 0 : Math.round((a[last] - a[prev]) * 100) / 100;
+  return {
+    labels: dates.map(_fmtLbl),
+    series,
+    delta: { online: delta(series.onlinePct), partial: delta(series.partialPct),
+             offline: delta(series.offlinePct), mpd: delta(series.mpdUptime), atg: delta(series.atgUptime) },
+  };
+}
+
+// ── ANNOTATION WRITES ──────────────────────────────────────────────────────
+async function _saveAnnotation(b){
+  if(!b || !b.roId) return { ok:false, error:'Missing roId.' };
+  await _db.collection('annotations').doc(String(b.roId)).set({
+    roId: String(b.roId), territory: b.territory || '', state: b.state || '',
+    status: b.status || '', dep: b.dep || '', iss: b.iss || '', rmk: b.rmk || '',
+    updatedAt: new Date().toISOString(), updatedBy: b.updatedBy || b.territory || '',
+  }, { merge: true });
+  return { ok:true, roId: b.roId };
+}
+async function _saveNoob(b){
+  if(!b || !b.roId) return { ok:false, error:'Missing roId.' };
+  await _db.collection('noobAnnotations').doc(String(b.roId)).set({
+    roId: String(b.roId), name: b.name || '', territory: b.territory || '',
+    reason: b.reason || '', rmk: b.rmk || '',
+    updatedAt: new Date().toISOString(), updatedBy: b.updatedBy || b.territory || '',
+  }, { merge: true });
+  return { ok:true, roId: b.roId };
+}
+
+// ── SUMMARIES ──────────────────────────────────────────────────────────────
+function _slimRow(r){
+  return {
+    roId: String(r.roId || ''), name: String(r.name || ''), vendor: String(r.vendor || ''),
+    area: String(r.area || ''), terr: String(r.terr || ''), state: String(r.state || ''),
+    iot: String(r.iot || ''),
+    mOn: +r.mOn || 0, mOl: +r.mOl || 0, mOff: +r.mOff || 0,
+    tOn: +r.tOn || 0, tOl: +r.tOl || 0, tOff: +r.tOff || 0,
+    mpdStatus: String(r.mpdStatus || ''), atgStatus: String(r.atgStatus || ''), status: String(r.status || ''),
+    mpdU: +r.mpdU || 0, atgU: +r.atgU || 0, roU: +r.roU || 0,
+    mMis: String(r.mMis || ''), tMis: String(r.tMis || ''),
+  };
+}
+function _summariseGroup(list){
+  const tot     = list.length;
+  const online  = list.filter(r => r.status === 'Fully Online').length;
+  const partial = list.filter(r => r.status === 'Partially Online').length;
+  const offline = list.filter(r => r.status === 'Offline').length;
+  const mOnb = list.reduce((s, r) => s + (+r.mOn || 0), 0);
+  const mOl  = list.reduce((s, r) => s + (+r.mOl || 0), 0);
+  const tOnb = list.reduce((s, r) => s + (+r.tOn || 0), 0);
+  const tOl  = list.reduce((s, r) => s + (+r.tOl || 0), 0);
+  return {
+    onlinePct: _pct(online, tot), partialPct: _pct(partial, tot), offlinePct: _pct(offline, tot),
+    mpdUptime: _pct(mOl, mOnb), atgUptime: _pct(tOl, tOnb),
+  };
+}
+async function _writeSummaries(date, rows){
+  // Region
+  await _db.collection('dailySummary').doc(date).set(Object.assign({ date }, _summariseGroup(rows)));
+  // State
+  const states = [...new Set(rows.map(r => r.state).filter(Boolean))].sort();
+  const stateRows = states.map(st => Object.assign({ state: st }, _summariseGroup(rows.filter(r => r.state === st))));
+  await _db.collection('stateSummary').doc(date).set({ date, rows: stateRows });
+  // Territory
+  const terrs = [...new Set(rows.map(r => r.terr).filter(Boolean))].sort();
+  const terrRows = terrs.map(tr => {
+    const g = rows.filter(r => r.terr === tr);
+    return Object.assign({ terr: tr, state: g[0] ? g[0].state : '' }, _summariseGroup(g));
+  });
+  await _db.collection('terrSummary').doc(date).set({ date, rows: terrRows });
+}
+async function _addDate(date){
+  const ref = _db.collection('meta').doc('dates');
+  const d = await ref.get();
+  const set = new Set(d.exists ? (d.data().dates || []) : []);
+  set.add(date);
+  await ref.set({ dates: [...set].sort() });
+}
+async function _batchDelete(refs){
+  for(let i = 0; i < refs.length; i += 400){
+    const b = _db.batch();
+    refs.slice(i, i + 400).forEach(r => b.delete(r));
+    await b.commit();
   }
-  sendNext(1);
+}
+async function _rebuildSummaries(){
+  const dates = await _getDates();
+  if(!dates.length) return { ok:false, error:'No dated data found' };
+  const rebuilt = [];
+  for(const date of dates){
+    try{
+      const d = await _getData(date);
+      if(d.rows.length){ await _writeSummaries(date, d.rows); rebuilt.push({ date, count: d.rows.length, ok:true }); }
+      else rebuilt.push({ date, ok:false, error:'No rows' });
+    }catch(e){ rebuilt.push({ date, ok:false, error: e.message }); }
+  }
+  return { ok:true, rebuilt };
+}
+
+// ── UPLOAD (HOS daily) — Firestore-native, same signature as before ────────
+async function gasUploadChunked(date, rows, onProgress, onDone){
+  try{
+    if(!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('Invalid date — expected YYYY-MM-DD');
+    if(!rows || !rows.length) throw new Error('No rows to upload');
+    const CH = 800;
+    const snapDoc = _db.collection('snapshots').doc(date);
+
+    // Clean replace: delete any existing chunk docs for this date
+    const existing = await snapDoc.collection('chunks').get();
+    await _batchDelete(existing.docs.map(d => d.ref));
+
+    const chunks = [];
+    for(let i = 0; i < rows.length; i += CH) chunks.push(rows.slice(i, i + CH));
+
+    for(let i = 0; i < chunks.length; i++){
+      await snapDoc.collection('chunks').doc('c' + String(i).padStart(4, '0'))
+        .set({ rows: chunks[i].map(_slimRow) });
+      if(onProgress) onProgress(i + 1, chunks.length);
+    }
+    await snapDoc.set({ date, count: rows.length, chunks: chunks.length, createdAt: new Date().toISOString() });
+    await _writeSummaries(date, rows);
+    await _addDate(date);
+    if(onDone) onDone(true);
+  }catch(err){
+    if(onDone) onDone(false, err.message);
+  }
+}
+
+// ── UPLOAD (BL Master) — Firestore-native, same signature as before ────────
+async function gasUploadBLChunked(rows, onDone){
+  try{
+    if(!rows || !rows.length) throw new Error('No BL rows to upload');
+    const existing = await _db.collection('blMaster').get();
+    await _batchDelete(existing.docs.map(d => d.ref));
+    const CH = 1500;
+    const chunks = [];
+    for(let i = 0; i < rows.length; i += CH) chunks.push(rows.slice(i, i + CH));
+    for(let i = 0; i < chunks.length; i++){
+      await _db.collection('blMaster').doc('c' + String(i).padStart(4, '0'))
+        .set({ rows: chunks[i].map(r => [String(r.roId || ''), r.name || '', r.terr || '']) });
+    }
+    await _db.collection('meta').doc('bl').set({ count: rows.length, chunks: chunks.length });
+    if(onDone) onDone(true);
+  }catch(err){
+    if(onDone) onDone(false, err.message);
+  }
+}
+
+// ── AUTH + USER MANAGEMENT (Firebase Authentication) ───────────────────────
+async function _login(username, password){
+  if(!username || !password) return { ok:false, error:'Username and password required' };
+  let cred;
+  try{
+    cred = await _auth.signInWithEmailAndPassword(_email(username), password);
+  }catch(e){
+    if(e.code === 'auth/too-many-requests') return { ok:false, error:'Too many attempts — try again later' };
+    return { ok:false, error:'Invalid username or password' };
+  }
+  const uid  = cred.user.uid;
+  const udoc = await _db.collection('users').doc(uid).get();
+  if(!udoc.exists){ await _auth.signOut(); return { ok:false, error:'No profile found — contact admin' }; }
+  const u = udoc.data();
+  if(u.active === false){ await _auth.signOut(); return { ok:false, error:'Account is deactivated — contact admin' }; }
+  _db.collection('users').doc(uid).set({ lastLogin: new Date().toISOString() }, { merge:true }).catch(()=>{});
+  return { ok:true, token: uid, user: {
+    username: u.username, role: u.role, territory: u.territory || '', state: u.state || '', name: u.name || '',
+  }};
+}
+async function _listUsers(){
+  const snaps = await _db.collection('users').get();
+  const users = snaps.docs.map(d => {
+    const u = d.data();
+    return { username: u.username, role: u.role, territory: u.territory || '', state: u.state || '',
+             name: u.name || '', active: u.active !== false, createdBy: u.createdBy || '',
+             createdAt: u.createdAt || '', lastLogin: u.lastLogin || '' };
+  }).filter(u => u.username);
+  return { ok:true, users };
+}
+async function _findUserRefByName(username){
+  const q = await _db.collection('users').where('username', '==', String(username).toLowerCase().trim()).limit(1).get();
+  return q.empty ? null : q.docs[0].ref;
+}
+async function _createUser(p){
+  const username = String(p.username || '').trim().toLowerCase();
+  const password = String(p.password || '');          // RAW password (frontend no longer hashes)
+  const role     = String(p.role || '').trim();
+  const name     = String(p.name || p.username || '').trim();
+  const terr     = String(p.territory || '').trim().toUpperCase();
+  const state    = String(p.state || '').trim().toUpperCase();
+
+  if(!username || !password || !role) return { ok:false, error:'Username, password and role are required' };
+  if(!/^[a-z0-9._-]{3,30}$/.test(username)) return { ok:false, error:'Username must be 3-30 chars, letters/digits/._- only' };
+  if(!['admin','re','se','ta'].includes(role)) return { ok:false, error:'Role must be admin, re, se, or ta' };
+  if(role === 'ta' && !terr)  return { ok:false, error:'Territory is required for TA role' };
+  if(role === 'se' && !state) return { ok:false, error:'State is required for SE role' };
+  if(password.length < 6)     return { ok:false, error:'Password must be at least 6 characters' };
+  if(await _findUserRefByName(username)) return { ok:false, error:'Username "' + username + '" already exists' };
+
+  // Create the Auth user on a SECONDARY app instance so the admin stays signed in.
+  const sec = firebase.apps.find(a => a.name === 'sec') || firebase.initializeApp(FIREBASE_CONFIG, 'sec');
+  let uid;
+  try{
+    const c = await sec.auth().createUserWithEmailAndPassword(_email(username), password);
+    uid = c.user.uid;
+  }catch(e){
+    if(e.code === 'auth/email-already-in-use') return { ok:false, error:'Username "' + username + '" already exists' };
+    if(e.code === 'auth/weak-password')        return { ok:false, error:'Password must be at least 6 characters' };
+    return { ok:false, error: e.message };
+  }
+  // Profile doc written from the PRIMARY (admin) context so security rules allow it.
+  await _db.collection('users').doc(uid).set({
+    username, name, role, territory: terr, state, active: true,
+    createdBy: (USER_INFO && USER_INFO.username) || 'admin',
+    createdAt: new Date().toISOString(), lastLogin: '',
+  });
+  await sec.auth().signOut().catch(()=>{});
+  return { ok:true, username };
+}
+async function _updateUser(p){
+  const ref = await _findUserRefByName(p.username);
+  if(!ref) return { ok:false, error:'User "' + p.username + '" not found' };
+  const upd = {};
+  if(p.role      !== undefined && p.role !== '') upd.role      = p.role;
+  if(p.territory !== undefined)                  upd.territory = p.territory;
+  if(p.state     !== undefined)                  upd.state     = p.state;
+  if(p.name      !== undefined && p.name !== '') upd.name      = p.name;
+  if(p.active    !== undefined)                  upd.active    = (p.active === 'true' || p.active === true);
+  await ref.set(upd, { merge:true });
+  return { ok:true };
+}
+async function _deleteUser(p){
+  if(String(p.username).toLowerCase() === 'admin') return { ok:false, error:'Cannot delete the admin account' };
+  const ref = await _findUserRefByName(p.username);
+  if(!ref) return { ok:false, error:'User not found' };
+  await ref.delete();   // profile removed → login is denied. (Auth record is orphaned but harmless.)
+  return { ok:true };
+}
+async function _changePassword(p){
+  const target  = String(p.username || '').toLowerCase().trim();
+  const myUname = (USER_INFO && USER_INFO.username) ? USER_INFO.username.toLowerCase() : '';
+  const newPwd  = p.newPassword || '';
+  if(!newPwd) return { ok:false, error:'New password required' };
+  if(target && target !== myUname){
+    // The Firebase client SDK cannot set another user's password. This is the only
+    // admin action that needs the optional Cloud Function (see the setup guide).
+    return { ok:false, error:'Resetting another user\'s password needs the optional Cloud Function (see setup guide). Users can also change their own password once signed in.' };
+  }
+  try{
+    await _auth.currentUser.updatePassword(newPwd);
+    return { ok:true };
+  }catch(e){
+    if(e.code === 'auth/requires-recent-login') return { ok:false, error:'Please sign out and back in, then try again.' };
+    if(e.code === 'auth/weak-password')         return { ok:false, error:'Password must be at least 6 characters' };
+    return { ok:false, error: e.message };
+  }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1727,8 +1964,7 @@ async function doLogin(){
   btn.textContent = 'Signing in…';
 
   try {
-    const hash = await hashPassword(password);
-    gasGet('login', { username, hash }, res => {
+    gasGet('login', { username, password }, res => {
       btn.disabled = false;
       btn.textContent = 'Sign In →';
       if(!res || !res.ok || !res.data || !res.data.ok){
@@ -1817,6 +2053,7 @@ function gasInit(){
     // BL Master — load from cloud, no daily upload needed
     if(d.blRows && d.blRows.length){
       BL_ROWS = d.blRows;
+      buildCCMap();   // rebuild customer → {terr,state} record (backfills state on legacy rows)
       const blStat = $('blCloudStatus');
       if(blStat) blStat.innerHTML = `<span style="color:var(--green);font-weight:600">✓ ${BL_ROWS.length.toLocaleString('en-IN')} active ROs loaded from cloud</span>`;
     } else {
@@ -1907,7 +2144,7 @@ function diagnoseCloud(){
  */
 function rebuildCloudSummaries(){
   toast('Rebuilding summaries from cloud data tabs…', 6000);
-  gasGet('rebuildSummaries', {key: GAS_WRITE_KEY}, res => {
+  gasGet('rebuildSummaries', {}, res => {
     if(!gasWriteOk(res)){
       toast('⚠ Rebuild failed: ' + gasWriteErr(res));
       return;
@@ -1951,6 +2188,33 @@ let ROLE = '';
 let ROWS = [];
 let BL_ROWS = [];       // All active ROs from BL Master
 let NOT_ONBOARDED = []; // BL rows not in ROWS
+
+// ── Territory → State mapping ──────────────────────────────────────────
+// BL Master carries Territory but not State. This map derives State from the
+// (clean) BL territory name. Edit here if a new territory is added.
+const TERR_STATE = {
+  'Bangalore':'Karnataka','Belgaum':'Karnataka','Gulbarga':'Karnataka',
+  'Mangalore':'Karnataka','Mysore':'Karnataka',
+  'Calicut':'Kerala','Ernakulam':'Kerala',
+  'Chennai':'Tamil Nadu','Coimbatore':'Tamil Nadu','Karur':'Tamil Nadu',
+  'Madurai':'Tamil Nadu','Tirunelveli':'Tamil Nadu','Trichy':'Tamil Nadu',
+  'Hyderabad':'Telangana','Nizamabad':'Telangana','Warangal':'Telangana',
+  'Nellore':'Andhra Pradesh','Vijayawada':'Andhra Pradesh','Vizag':'Andhra Pradesh',
+};
+const stateForTerr = t => TERR_STATE[String(t||'').trim()] || '';
+
+// ── Customer (RO ID) → { terr, state } record, built from BL Master ────
+// This is the single source of truth for an RO's territory & state; the daily
+// HOS upload looks up terr/state from here by RO ID instead of trusting the
+// HOS file's own (inconsistent) territory/state columns.
+let CC_MAP = {};
+function buildCCMap(){
+  CC_MAP = {};
+  BL_ROWS.forEach(r=>{
+    if(!r.state) r.state = stateForTerr(r.terr);   // backfill legacy/cloud BL rows
+    CC_MAP[r.roId] = { terr:r.terr, state:r.state };
+  });
+}
 let FILE_NAME = '';
 let FILE_DATE = '';
 let F = { territory:'', state:'', vendor:'', iot:'', status:'', q:'' };
@@ -2053,12 +2317,15 @@ function detectCols(hl){
     vendor:exact('ra vendor','vendor'),
     area:  exact('sales area'),
     terr:  exact('territory'),
-    state: exact('state'),
+    // HOS 222 mislabels the state column as "state office"/"state offlice".
+    state: exact('state','state office','state offlice'),
     iot:   exact('iot enabled','iot'),
-    mOn:   exact('no. of on-boarded mpds','mpd onboarded'),
-    mOl:   exact('no. of online mpds','mpd online'),
-    tOn:   exact('no. of on-boarded tanks','tank onboarded'),
-    tOl:   exact('no. of online tanks','tank online'),
+    // HOS 222 headers: " MPDs" / " Online MPDs" / " Tanks" / "Online Tanks"
+    // (trimmed+lowercased before detection). Onboarded = total device count.
+    mOn:   exact('no. of on-boarded mpds','mpd onboarded','mpds'),
+    mOl:   exact('no. of online mpds','mpd online','online mpds'),
+    tOn:   exact('no. of on-boarded tanks','tank onboarded','tanks'),
+    tOl:   exact('no. of online tanks','tank online','online tanks'),
     mMis:  exact('mpd configuration mismatch','mpd config mismatch'),
     tMis:  exact('tank configuration mismatch','tank config mismatch'),
   };
@@ -2099,13 +2366,14 @@ function loadFile(inp){
 
       const hl=raw[0].map(x=>String(x||'').trim().toLowerCase());
       const C=detectCols(hl);
-      const missing=Object.entries(C).filter(([k,v])=>v<0&&['roId','name','vendor','terr','state','mOn','mOl','tOn','tOl'].includes(k)).map(([k])=>k);
+      // terr/state are NOT required in HOS — they come from the BL customer map.
+      const missing=Object.entries(C).filter(([k,v])=>v<0&&['roId','name','vendor','mOn','mOl','tOn','tOl'].includes(k)).map(([k])=>k);
       if(missing.length){
         H('uploadMsg',`<div style="background:var(--red-lt);border:1px solid var(--red);border-radius:8px;padding:12px 15px;margin-top:14px;font-size:13px;max-width:480px">⚠️ Missing columns: <b>${missing.join(', ')}</b></div>`);
         return;
       }
 
-      const rows=[];
+      const rows=[]; let unmapped=0;
       for(let i=1;i<raw.length;i++){
         const r=raw[i];
         const id=String(r[C.roId]||'').trim(); if(!id) continue;
@@ -2114,12 +2382,18 @@ function loadFile(inp){
         const mOff=Math.max(0,mOn-mOl), tOff=Math.max(0,tOn-tOl);
         const mpdU=mOn?mOl/mOn:0, atgU=tOn?tOl/tOn:0;
         const roU=(mpdU+atgU)/2;
+        // Territory & State come from the BL customer record (CC_MAP), NOT the
+        // HOS file. Fall back to the HOS columns only when the RO is absent
+        // from BL Master (counted for the upload summary).
+        const cc = CC_MAP[id];
+        const terr  = cc ? cc.terr  : String(r[C.terr]||'').trim();
+        const state = cc ? cc.state : (stateForTerr(terr) || String(r[C.state]||'').trim());
+        if(!cc) unmapped++;
         rows.push({
           roId:id, name:String(r[C.name]||'').trim(),
           vendor:String(r[C.vendor]||'').trim(),
           area:String(r[C.area]||'').trim(),
-          terr:String(r[C.terr]||'').trim(),
-          state:String(r[C.state]||'').trim(),
+          terr, state,
           iot:(String(r[C.iot]||'').trim().toLowerCase()==='yes'?'IOT':'Non-IOT'),
           mOn,mOl,mOff,tOn,tOl,tOff,
           mMis:C.mMis>=0?String(r[C.mMis]||'').trim():'',
@@ -2162,6 +2436,7 @@ function loadFile(inp){
           Partial: <b style="color:var(--amber)">${part.toLocaleString('en-IN')}</b> &nbsp;|&nbsp;
           Offline: <b style="color:var(--red)">${off.toLocaleString('en-IN')}</b>
         </div>
+        ${unmapped?`<div style="font-size:12px;color:var(--amber);margin-top:4px">⚠ ${unmapped.toLocaleString('en-IN')} RO(s) not found in BL Master — territory/state taken from the HOS file for those. ${BL_ROWS.length?'':'Upload BL Master to map all ROs.'}</div>`:''}
         <div id="gasUploadStatus" style="margin-top:10px;font-size:12px;color:var(--text-dim)">📡 Saving to cloud…</div>
         <div style="height:6px;background:var(--border);border-radius:3px;margin-top:6px;overflow:hidden">
           <div id="gasUploadBar" style="height:100%;width:0%;background:var(--navy);border-radius:3px;transition:width .3s"></div>
@@ -2219,9 +2494,11 @@ function loadBLFile(inp){
       for(let i=1;i<raw.length;i++){
         const r=raw[i];
         const id=String(r[cIdx]||'').trim(); if(!id||id==='0') continue;
-        rows.push({ roId:id, name:String(r[nIdx]||'').trim(), terr:String(r[tIdx]||'').trim() });
+        const terr=String(r[tIdx]||'').trim();
+        rows.push({ roId:id, name:String(r[nIdx]||'').trim(), terr, state:stateForTerr(terr) });
       }
       BL_ROWS=rows;
+      buildCCMap();          // customer → {terr,state} record used by HOS uploads
       computeNotOnboarded();
       H('blUploadMsg',`<div class="success-box">
         <div style="font-weight:700;color:#065F46;margin-bottom:4px">✓ BL Master: ${rows.length.toLocaleString('en-IN')} ROs loaded</div>
@@ -3907,8 +4184,7 @@ async function submitCreateUser(){
   }
   msgEl.textContent = 'Creating user…';
 
-  const hash = await hashPassword(password);
-  gasGet('createUser', { token: _sessionToken, username, name, role, password: hash, territory, state }, res => {
+  gasGet('createUser', { token: _sessionToken, username, name, role, password, territory, state }, res => {
     if(!res || !res.ok || !res.data || !res.data.ok){
       msgEl.innerHTML = '<span style="color:var(--red)">⚠ ' + E((res&&res.data&&res.data.error)||'Failed to create user') + '</span>';
       return;
@@ -3932,8 +4208,7 @@ async function submitResetPassword(){
   const msgEl    = $('resetPwdMsg');
   if(!newPwd){ msgEl.innerHTML='<span style="color:var(--red)">Enter a new password.</span>'; return; }
   msgEl.textContent = 'Resetting…';
-  const newHash = await hashPassword(newPwd);
-  gasGet('changePassword', { token: _sessionToken, username, newHash }, res => {
+  gasGet('changePassword', { token: _sessionToken, username, newPassword: newPwd }, res => {
     if(!res || !res.ok || !res.data || !res.data.ok){
       msgEl.innerHTML = '<span style="color:var(--red)">⚠ ' + E((res&&res.data&&res.data.error)||'Failed') + '</span>';
       return;
